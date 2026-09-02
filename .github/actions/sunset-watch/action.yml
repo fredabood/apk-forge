@@ -1,0 +1,85 @@
+name: Sunset watch
+description: >-
+  Watch for upstream shipping an official Android channel, and open a single
+  discontinue notice when it does. These build repos exist to fill a gap; when
+  the gap closes they should be retired rather than quietly competing with the
+  real thing.
+
+inputs:
+  upstream-repo:
+    description: 'Upstream repository, "owner/name".'
+    required: true
+  watch-issue:
+    description: >-
+      Optional upstream issue number tracking official Android distribution.
+      Its closure counts as an official channel appearing.
+    required: false
+    default: ''
+  publish-repo:
+    description: 'Repository where the discontinue notice is opened.'
+    required: false
+    default: ${{ github.repository }}
+  notice-title:
+    description: 'Title of the discontinue issue (also the dedupe key).'
+    required: false
+    default: 'Upstream now ships an official Android channel — discontinue this repo'
+  github-token:
+    description: 'Token used to read upstream and open the notice.'
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        UPSTREAM: ${{ inputs.upstream-repo }}
+        WATCH_ISSUE: ${{ inputs.watch-issue }}
+        PUBLISH_REPO: ${{ inputs.publish-repo }}
+        TITLE: ${{ inputs.notice-title }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        official=false
+        reason=""
+
+        if [ -n "$WATCH_ISSUE" ]; then
+          state="$(gh api "repos/$UPSTREAM/issues/$WATCH_ISSUE" --jq .state 2>/dev/null || echo unknown)"
+          if [ "$state" = "closed" ]; then
+            official=true
+            reason="$UPSTREAM#$WATCH_ISSUE (official Android distribution) is closed"
+          fi
+        fi
+
+        if [ "$official" = false ]; then
+          apk_assets="$(gh api "repos/$UPSTREAM/releases?per_page=30" \
+                          --jq '[.[].assets[].name | select(endswith(".apk"))] | length' 2>/dev/null || echo 0)"
+          if [ "${apk_assets:-0}" -gt 0 ]; then
+            official=true
+            reason="an upstream release now carries an .apk asset"
+          fi
+        fi
+
+        if [ "$official" = false ]; then
+          echo "no official Android channel yet — this repo still fills a gap"
+          exit 0
+        fi
+
+        # Open the notice at most once. A watch that files a fresh issue every
+        # six hours trains its only reader to ignore it.
+        existing="$(gh issue list --repo "$PUBLISH_REPO" --state open --search "$TITLE" \
+                      --json title --jq '.[].title' 2>/dev/null || true)"
+        if printf '%s\n' "$existing" | grep -Fxq "$TITLE"; then
+          echo "::warning::$reason — discontinue notice already open"
+          exit 0
+        fi
+
+        gh issue create --repo "$PUBLISH_REPO" --title "$TITLE" --body \
+          "Detected: $reason
+
+        Prefer the official builds. Switching requires an uninstall and reinstall — the
+        certificates differ, and Android forbids cross-signature updates. Archive this repo
+        once you have migrated."
+
+        echo "::warning::$reason — opened a discontinue notice"

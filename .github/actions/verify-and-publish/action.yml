@@ -1,0 +1,96 @@
+name: Verify signature and publish
+description: >-
+  Refuse to publish an APK whose signing certificate is not the expected one,
+  then cut a GitHub Release carrying it.
+
+inputs:
+  apk-path:
+    description: 'Path to the built release APK.'
+    required: true
+  expected-cert-sha256:
+    description: >-
+      Expected signing certificate SHA-256, colon-separated uppercase hex.
+      Every published APK must carry this or devices cannot update in place.
+    required: true
+  tag:
+    description: 'Release tag (the upstream ref).'
+    required: true
+  asset-name:
+    description: 'Filename for the published asset.'
+    required: true
+  release-notes-file:
+    description: 'Path to a file holding the release body.'
+    required: true
+  publish:
+    description: 'Set false to verify only, without creating a release.'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used to create the release.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  cert-sha256:
+    description: 'The fingerprint actually found on the built APK.'
+    value: ${{ steps.verify.outputs.cert-sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - id: verify
+      shell: bash
+      env:
+        APK: ${{ inputs.apk-path }}
+        EXPECTED: ${{ inputs.expected-cert-sha256 }}
+        ASSET_NAME: ${{ inputs.asset-name }}
+      run: |
+        set -euo pipefail
+
+        [ -f "$APK" ] || {
+          echo "::error::APK not found at $APK — the build step produced nothing"
+          exit 1
+        }
+
+        tool="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -1)"
+        [ -n "$tool" ] || { echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
+
+        got="$("$tool" verify --print-certs "$APK" \
+                | grep -i 'SHA-256 digest' | head -1 | awk '{print toupper($NF)}' \
+                | sed 's/../&:/g; s/:$//')"
+
+        [ -n "$got" ] || {
+          echo "::error::could not read a signing certificate from $APK — is it unsigned?"
+          exit 1
+        }
+
+        echo "built cert: $got"
+        printf 'cert-sha256=%s\n' "$got" >> "$GITHUB_OUTPUT"
+
+        # This gate is load-bearing, not a nicety. Both Gradle and Flutter skip
+        # release signing SILENTLY when credentials are missing, producing a
+        # green build and an unsigned APK. And an APK signed by a different key
+        # cannot update an installed one — Android forbids cross-signature
+        # updates, so publishing it would strand every device on the old build
+        # with no upgrade path but uninstall.
+        if [ "$got" != "$EXPECTED" ]; then
+          echo "::error::signing cert mismatch — refusing to publish an unupdateable APK"
+          echo "  expected: $EXPECTED"
+          echo "  got:      $got"
+          exit 1
+        fi
+
+        mkdir -p "$RUNNER_TEMP/apk-forge-out"
+        cp "$APK" "$RUNNER_TEMP/apk-forge-out/$ASSET_NAME"
+        echo "staged $RUNNER_TEMP/apk-forge-out/$ASSET_NAME"
+
+    - name: Publish release
+      if: inputs.publish == 'true'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.tag }}
+        name: ${{ inputs.tag }}
+        prerelease: false
+        files: ${{ runner.temp }}/apk-forge-out/${{ inputs.asset-name }}
+        body_path: ${{ inputs.release-notes-file }}
+        token: ${{ inputs.github-token }}

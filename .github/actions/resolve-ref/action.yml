@@ -1,0 +1,177 @@
+name: Resolve upstream ref
+description: >-
+  Pick the newest upstream ref worth building, and say plainly why not when
+  there isn't one. Handles ranking, dedupe against already-published releases,
+  and an optional path filter.
+
+inputs:
+  upstream-repo:
+    description: 'Upstream repository, "owner/name".'
+    required: true
+  ref-source:
+    description: '"tags" or "releases" — where candidate refs come from.'
+    required: false
+    default: tags
+  ref-pattern:
+    description: 'Extended regex a ref must match in full to be a candidate.'
+    required: true
+  ref-prefix:
+    description: 'Leading string stripped from a ref to get the version (e.g. "v").'
+    required: false
+    default: ''
+  requested-ref:
+    description: 'Explicit ref to build, bypassing ranking. Empty = pick the newest.'
+    required: false
+    default: ''
+  publish-repo:
+    description: 'Repository whose releases are checked for dedupe.'
+    required: false
+    default: ${{ github.repository }}
+  path-filter:
+    description: >-
+      Optional path in the upstream repo. When set, a candidate is skipped if
+      that path has not changed since the last published release.
+    required: false
+    default: ''
+  force:
+    description: 'Build even if the release exists or the path filter says skip.'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'Token used for upstream and publish-repo API reads.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  ref:
+    description: 'The chosen upstream ref.'
+    value: ${{ steps.resolve.outputs.ref }}
+  version:
+    description: 'Version parsed from the ref (prefix and rc suffix stripped).'
+    value: ${{ steps.resolve.outputs.version }}
+  version-code:
+    description: 'Monotonic integer versionCode derived from the version.'
+    value: ${{ steps.resolve.outputs.version-code }}
+  should-build:
+    description: '"true" or "false".'
+    value: ${{ steps.resolve.outputs.should-build }}
+  reason:
+    description: 'Human-readable explanation of the decision.'
+    value: ${{ steps.resolve.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        UPSTREAM: ${{ inputs.upstream-repo }}
+        REF_SOURCE: ${{ inputs.ref-source }}
+        REF_PATTERN: ${{ inputs.ref-pattern }}
+        REF_PREFIX: ${{ inputs.ref-prefix }}
+        REQUESTED_REF: ${{ inputs.requested-ref }}
+        PUBLISH_REPO: ${{ inputs.publish-repo }}
+        PATH_FILTER: ${{ inputs.path-filter }}
+        FORCE: ${{ inputs.force }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        # The ranker is the repo-root script, not a copy vendored into this
+        # action, so the unit tests in scripts/ cover the code that actually
+        # runs. Assert the path rather than letting a layout change degrade
+        # into a silent fallback.
+        RANKER="$GITHUB_ACTION_PATH/../../../scripts/rank-refs.sh"
+        [ -x "$RANKER" ] || [ -f "$RANKER" ] || {
+          echo "::error::rank-refs.sh not found at $RANKER — apk-forge layout changed"
+          exit 1
+        }
+
+        emit() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+        if [ -n "$REQUESTED_REF" ]; then
+          ref="$REQUESTED_REF"
+          parsed="$(printf '%s\n' "$ref" | bash "$RANKER" --pattern "$REF_PATTERN" --prefix "$REF_PREFIX")" || {
+            echo "::error::requested ref '$ref' does not match $REF_PATTERN"
+            exit 1
+          }
+          version="$(printf '%s' "$parsed" | cut -f2)"
+          code="$(printf '%s' "$parsed" | cut -f3)"
+          echo "explicit ref requested: $ref"
+        else
+          case "$REF_SOURCE" in
+            tags)
+              refs="$(gh api "repos/$UPSTREAM/git/matching-refs/tags" --paginate \
+                        --jq '.[].ref' | sed 's#^refs/tags/##')"
+              ;;
+            releases)
+              # Drafts are invisible to consumers; prereleases are excluded by
+              # the caller's pattern if it wants them excluded.
+              refs="$(gh api "repos/$UPSTREAM/releases" --paginate \
+                        --jq '.[] | select(.draft == false) | .tag_name')"
+              ;;
+            *)
+              echo "::error::ref-source must be 'tags' or 'releases', got '$REF_SOURCE'"
+              exit 1
+              ;;
+          esac
+
+          parsed="$(printf '%s\n' "$refs" | bash "$RANKER" --pattern "$REF_PATTERN" --prefix "$REF_PREFIX")" || {
+            echo "::error::no upstream ref in $UPSTREAM matched $REF_PATTERN"
+            exit 1
+          }
+          ref="$(printf '%s' "$parsed" | cut -f1)"
+          version="$(printf '%s' "$parsed" | cut -f2)"
+          code="$(printf '%s' "$parsed" | cut -f3)"
+          echo "newest upstream ref: $ref (version $version, code $code)"
+        fi
+
+        emit ref "$ref"
+        emit version "$version"
+        emit version-code "$code"
+
+        if [ "$FORCE" = "true" ]; then
+          emit should-build true
+          emit reason "force requested"
+          echo "force=true — building regardless of dedupe and path filter"
+          exit 0
+        fi
+
+        # Dedupe: a release for this ref already exists.
+        if gh release view "$ref" --repo "$PUBLISH_REPO" >/dev/null 2>&1; then
+          emit should-build false
+          emit reason "release $ref already published"
+          echo "release $ref already exists in $PUBLISH_REPO — nothing to do"
+          exit 0
+        fi
+
+        # Path filter: skip when the interesting subtree is unchanged since the
+        # last release we published.
+        #
+        # This compares the LAST COMMIT TOUCHING the path at each ref. It does
+        # NOT use the compare API: `repos/{}/compare/{a}...{b}` truncates its
+        # file list (300 files), so a multi-release range reports "0 files
+        # changed" for a path that did change — measured on omnigent-ai/omnigent
+        # v0.7.0...v0.12.0, which reports 0 while web/android demonstrably moved
+        # at every release. A skip rule built on that would never build again.
+        if [ -n "$PATH_FILTER" ]; then
+          last_tag="$(gh release view --repo "$PUBLISH_REPO" --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -z "$last_tag" ]; then
+            emit should-build true
+            emit reason "no previous release to compare against"
+            echo "no previous release — building"
+            exit 0
+          fi
+          sha_new="$(gh api "repos/$UPSTREAM/commits?path=$PATH_FILTER&sha=$ref&per_page=1" --jq '.[0].sha // ""')"
+          sha_old="$(gh api "repos/$UPSTREAM/commits?path=$PATH_FILTER&sha=$last_tag&per_page=1" --jq '.[0].sha // ""')"
+          if [ -n "$sha_new" ] && [ "$sha_new" = "$sha_old" ]; then
+            emit should-build false
+            emit reason "$PATH_FILTER unchanged between $last_tag and $ref (both at ${sha_new:0:9})"
+            echo "$PATH_FILTER unchanged since $last_tag — skipping. Re-run with force to override."
+            exit 0
+          fi
+          echo "$PATH_FILTER changed: $last_tag ${sha_old:0:9} -> $ref ${sha_new:0:9}"
+        fi
+
+        emit should-build true
+        emit reason "new upstream ref $ref"

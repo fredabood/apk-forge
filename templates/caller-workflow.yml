@@ -1,0 +1,119 @@
+# Template: unofficial Android build repo, driven by fredabood/apk-forge.
+#
+# Copy to .github/workflows/build.yml in the app repo, fill in the values under
+# `env`, and add .github/actions/build/action.yml for your toolchain.
+#
+# Your build action receives: keystore-path, keystore-password, key-alias,
+# key-password, version-name, version-code. It must output: apk-path.
+
+name: build
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream ref to build; empty = newest'
+        required: false
+        default: ''
+      force:
+        description: 'Build even if already released or unchanged'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: owner/name
+  REF_SOURCE: tags                                   # or: releases
+  REF_PATTERN: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  REF_PREFIX: v
+  PATH_FILTER: ''                                    # e.g. web/android — optional
+  ASSET_PREFIX: myapp
+  EXPECTED_CERT_SHA256: 'AA:BB:...'                  # from `keytool -list -v`
+  WATCH_ISSUE: ''                                    # upstream issue tracking official APKs
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      version: ${{ steps.r.outputs.version }}
+      version-code: ${{ steps.r.outputs.version-code }}
+      should-build: ${{ steps.r.outputs.should-build }}
+    steps:
+      - id: r
+        uses: fredabood/apk-forge/.github/actions/resolve-ref@main
+        with:
+          upstream-repo: ${{ env.UPSTREAM_REPO }}
+          ref-source: ${{ env.REF_SOURCE }}
+          ref-pattern: ${{ env.REF_PATTERN }}
+          ref-prefix: ${{ env.REF_PREFIX }}
+          path-filter: ${{ env.PATH_FILTER }}
+          requested-ref: ${{ inputs.ref }}
+          force: ${{ inputs.force }}
+
+      - uses: fredabood/apk-forge/.github/actions/sunset-watch@main
+        with:
+          upstream-repo: ${{ env.UPSTREAM_REPO }}
+          watch-issue: ${{ env.WATCH_ISSUE }}
+
+  build:
+    needs: check
+    if: needs.check.outputs.should-build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out upstream at ${{ needs.check.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.ref }}
+
+      # The caller's own build action lives in this repo, so it needs its own
+      # checkout alongside the upstream tree.
+      - name: Check out this repo (for the build action)
+        uses: actions/checkout@v4
+        with:
+          path: .caller
+
+      - id: keystore
+        uses: fredabood/apk-forge/.github/actions/restore-keystore@main
+        with:
+          keystore-b64: ${{ secrets.UPLOAD_KEYSTORE_B64 }}
+
+      - id: build
+        uses: ./.caller/.github/actions/build
+        with:
+          keystore-path: ${{ steps.keystore.outputs.path }}
+          keystore-password: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+          key-alias: ${{ secrets.UPLOAD_KEY_ALIAS }}
+          key-password: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+          version-name: ${{ needs.check.outputs.version }}
+          version-code: ${{ needs.check.outputs.version-code }}
+
+      - name: Release notes
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Unofficial CI build of [${{ env.UPSTREAM_REPO }}](https://github.com/${{ env.UPSTREAM_REPO }})
+          at upstream ref \`${{ needs.check.outputs.ref }}\`. Not affiliated with the upstream project.
+
+          - Signing cert SHA-256: \`${{ env.EXPECTED_CERT_SHA256 }}\`
+          - Install/update via Obtainium: add \`https://github.com/${{ github.repository }}\`
+          EOF
+
+      - uses: fredabood/apk-forge/.github/actions/verify-and-publish@main
+        with:
+          apk-path: ${{ steps.build.outputs.apk-path }}
+          expected-cert-sha256: ${{ env.EXPECTED_CERT_SHA256 }}
+          tag: ${{ needs.check.outputs.ref }}
+          asset-name: ${{ env.ASSET_PREFIX }}-${{ needs.check.outputs.version }}-universal.apk
+          release-notes-file: ${{ runner.temp }}/notes.md

@@ -1,0 +1,49 @@
+name: Restore signing keystore
+description: >-
+  Decode a base64 keystore secret to an absolute path outside the repository
+  checkout, and fail loudly if the decode produced nothing.
+
+inputs:
+  keystore-b64:
+    description: 'Base64-encoded keystore (a repository secret — never a plain input).'
+    required: true
+  filename:
+    description: 'Filename to write inside RUNNER_TEMP.'
+    required: false
+    default: upload.jks
+
+outputs:
+  path:
+    description: 'Absolute path to the restored keystore.'
+    value: ${{ steps.restore.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - id: restore
+      shell: bash
+      env:
+        KEYSTORE_B64: ${{ inputs.keystore-b64 }}
+        FILENAME: ${{ inputs.filename }}
+      run: |
+        set -euo pipefail
+
+        # The keystore MUST live outside the repository checkout, at an absolute
+        # path. Gradle resolves a relative storeFile against the app module and
+        # canonicalises it; Flutter's gradle wrapper does the same. A keystore
+        # written inside the checkout also risks being committed or archived.
+        dest="$RUNNER_TEMP/$FILENAME"
+
+        printf '%s' "$KEYSTORE_B64" | base64 -d > "$dest"
+
+        # An empty or truncated secret is the classic failure: the build still
+        # goes green and produces an UNSIGNED artifact, because both Gradle and
+        # Flutter skip the release signing config when credentials are absent.
+        # Catch it here; the fingerprint gate is the second net, not the first.
+        [ -s "$dest" ] || {
+          echo "::error::keystore decode produced an empty file — check the base64 secret"
+          exit 1
+        }
+
+        echo "restored keystore to $dest ($(wc -c < "$dest" | tr -d ' ') bytes)"
+        printf 'path=%s\n' "$dest" >> "$GITHUB_OUTPUT"
