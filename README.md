@@ -74,10 +74,19 @@ neither repo patches upstream source to build.
 
 Secrets live in the caller repo. This repo holds none.
 
+## A fourth trap: `required:` is not enforced
+
+**GitHub does not enforce `required: true` on composite-action inputs.** A missing one arrives as an
+empty string, and the failure surfaces later somewhere unrelated — an empty keystore secret becomes
+an *unsigned APK*, not a missing-input error. Every action here therefore guards its own inputs and
+fails naming the one that is absent. Treat the `required:` field in the schemas below as
+documentation, not as a gate; the guards are the gate.
+
 ## Tests
 
 ```sh
 bash scripts/rank-refs.test.sh
+bash scripts/skip-decision.test.sh
 ```
 
 Every assertion is paired with a **red proof**: the suite re-runs it against a deliberately broken

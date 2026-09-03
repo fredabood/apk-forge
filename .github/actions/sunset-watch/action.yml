@@ -41,6 +41,20 @@ runs:
       run: |
         set -euo pipefail
 
+        # GitHub does NOT enforce `required:` on composite-action inputs. A blank
+        # upstream repo here would silently watch nothing and always report "no
+        # official channel yet" — a watch that can never fire.
+        require() {
+          [ -n "$2" ] || {
+            echo "::error::apk-forge/sunset-watch: required input '$1' is empty or absent"
+            exit 1
+          }
+        }
+        require upstream-repo "$UPSTREAM"
+        require publish-repo  "$PUBLISH_REPO"
+        require notice-title  "$TITLE"
+        require github-token  "$GH_TOKEN"
+
         official=false
         reason=""
 

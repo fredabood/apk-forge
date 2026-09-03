@@ -28,6 +28,18 @@ runs:
       run: |
         set -euo pipefail
 
+        # GitHub does NOT enforce `required:` on composite-action inputs. Without
+        # this guard, an absent keystore secret decodes to an empty file and the
+        # failure surfaces as an unsigned APK much later.
+        [ -n "$KEYSTORE_B64" ] || {
+          echo "::error::apk-forge/restore-keystore: required input 'keystore-b64' is empty or absent"
+          exit 1
+        }
+        [ -n "$FILENAME" ] || {
+          echo "::error::apk-forge/restore-keystore: required input 'filename' is empty"
+          exit 1
+        }
+
         # The keystore MUST live outside the repository checkout, at an absolute
         # path. Gradle resolves a relative storeFile against the app module and
         # canonicalises it; Flutter's gradle wrapper does the same. A keystore

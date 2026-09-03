@@ -87,7 +87,28 @@ runs:
           exit 1
         }
 
+        DECIDER="$GITHUB_ACTION_PATH/../../../scripts/skip-decision.sh"
+        [ -f "$DECIDER" ] || {
+          echo "::error::skip-decision.sh not found at $DECIDER — apk-forge layout changed"
+          exit 1
+        }
+
         emit() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+        # GitHub does NOT enforce `required:` on composite-action inputs — a
+        # missing one arrives as an empty string and the failure surfaces later,
+        # somewhere unrelated. Name it here instead.
+        require() {
+          [ -n "$2" ] || {
+            echo "::error::apk-forge/resolve-ref: required input '$1' is empty or absent"
+            exit 1
+          }
+        }
+        require upstream-repo "$UPSTREAM"
+        require ref-source    "$REF_SOURCE"
+        require ref-pattern   "$REF_PATTERN"
+        require publish-repo  "$PUBLISH_REPO"
+        require github-token  "$GH_TOKEN"
 
         if [ -n "$REQUESTED_REF" ]; then
           ref="$REQUESTED_REF"
@@ -156,21 +177,30 @@ runs:
         # at every release. A skip rule built on that would never build again.
         if [ -n "$PATH_FILTER" ]; then
           last_tag="$(gh release view --repo "$PUBLISH_REPO" --json tagName --jq .tagName 2>/dev/null || true)"
-          if [ -z "$last_tag" ]; then
-            emit should-build true
-            emit reason "no previous release to compare against"
-            echo "no previous release — building"
-            exit 0
+          sha_new=''
+          sha_old=''
+          if [ -n "$last_tag" ]; then
+            sha_new="$(gh api "repos/$UPSTREAM/commits?path=$PATH_FILTER&sha=$ref&per_page=1" --jq '.[0].sha // ""' || true)"
+            sha_old="$(gh api "repos/$UPSTREAM/commits?path=$PATH_FILTER&sha=$last_tag&per_page=1" --jq '.[0].sha // ""' || true)"
           fi
-          sha_new="$(gh api "repos/$UPSTREAM/commits?path=$PATH_FILTER&sha=$ref&per_page=1" --jq '.[0].sha // ""')"
-          sha_old="$(gh api "repos/$UPSTREAM/commits?path=$PATH_FILTER&sha=$last_tag&per_page=1" --jq '.[0].sha // ""')"
-          if [ -n "$sha_new" ] && [ "$sha_new" = "$sha_old" ]; then
+
+          # The decision itself is a separate script so it can be unit-tested
+          # against fixtures — including the case that matters most, where BOTH
+          # lookups fail and two empty strings compare equal. A naive inline
+          # comparison reads that as "unchanged" and skips, and the app silently
+          # stops shipping.
+          decision="$(bash "$DECIDER" --new "$sha_new" --old "$sha_old" \
+                        --last-tag "$last_tag" --path "$PATH_FILTER" --ref "$ref")"
+          verdict="$(printf '%s' "$decision" | cut -f1)"
+          why="$(printf '%s' "$decision" | cut -f2)"
+          echo "path filter: $verdict — $why"
+
+          if [ "$verdict" = "skip" ]; then
             emit should-build false
-            emit reason "$PATH_FILTER unchanged between $last_tag and $ref (both at ${sha_new:0:9})"
-            echo "$PATH_FILTER unchanged since $last_tag — skipping. Re-run with force to override."
+            emit reason "$why"
+            echo "Re-run with force to override."
             exit 0
           fi
-          echo "$PATH_FILTER changed: $last_tag ${sha_old:0:9} -> $ref ${sha_new:0:9}"
         fi
 
         emit should-build true

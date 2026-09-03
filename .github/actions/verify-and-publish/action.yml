@@ -47,6 +47,19 @@ runs:
       run: |
         set -euo pipefail
 
+        # GitHub does NOT enforce `required:` on composite-action inputs. An empty
+        # expected fingerprint would make every comparison fail with a confusing
+        # message instead of naming the missing input.
+        require() {
+          [ -n "$2" ] || {
+            echo "::error::apk-forge/verify-and-publish: required input '$1' is empty or absent"
+            exit 1
+          }
+        }
+        require apk-path             "$APK"
+        require expected-cert-sha256 "$EXPECTED"
+        require asset-name           "$ASSET_NAME"
+
         [ -f "$APK" ] || {
           echo "::error::APK not found at $APK — the build step produced nothing"
           exit 1
