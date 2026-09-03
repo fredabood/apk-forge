@@ -47,6 +47,7 @@ jobs:
     outputs:
       ref: ${{ steps.r.outputs.ref }}
       version: ${{ steps.r.outputs.version }}
+      version-tag: ${{ steps.r.outputs.version-tag }}
       version-code: ${{ steps.r.outputs.version-code }}
       should-build: ${{ steps.r.outputs.should-build }}
     steps:
@@ -115,5 +116,5 @@ jobs:
           apk-path: ${{ steps.build.outputs.apk-path }}
           expected-cert-sha256: ${{ env.EXPECTED_CERT_SHA256 }}
           tag: ${{ needs.check.outputs.ref }}
-          asset-name: ${{ env.ASSET_PREFIX }}-${{ needs.check.outputs.version }}-universal.apk
+          asset-name: ${{ env.ASSET_PREFIX }}-${{ needs.check.outputs.version-tag }}-universal.apk
           release-notes-file: ${{ runner.temp }}/notes.md

@@ -47,8 +47,19 @@ outputs:
     description: 'The chosen upstream ref.'
     value: ${{ steps.resolve.outputs.ref }}
   version:
-    description: 'Version parsed from the ref (prefix and rc suffix stripped).'
+    description: >-
+      Version parsed from the ref, with the prefix AND any rc suffix stripped
+      (0.16.0). This is what a versionName wants — an rc suffix is not a valid
+      Android versionName component.
     value: ${{ steps.resolve.outputs.version }}
+  version-tag:
+    description: >-
+      The ref with only the prefix stripped, so any rc suffix survives
+      (0.16.0-rc.2). Use THIS for asset names when upstream ships release
+      candidates: naming assets after `version` collapses every candidate of a
+      release onto one filename, which either overwrites the previous asset or
+      leaves two side by side.
+    value: ${{ steps.resolve.outputs.version-tag }}
   version-code:
     description: 'Monotonic integer versionCode derived from the version.'
     value: ${{ steps.resolve.outputs.version-code }}
@@ -150,6 +161,11 @@ runs:
         emit ref "$ref"
         emit version "$version"
         emit version-code "$code"
+        # Prefix stripped, rc suffix kept. Asset names should use this: two
+        # candidates of the same release (…-rc.1, …-rc.2) must not collapse onto
+        # one filename, or a republish silently leaves two assets on the release
+        # instead of replacing one.
+        emit version-tag "${ref#"$REF_PREFIX"}"
 
         if [ "$FORCE" = "true" ]; then
           emit should-build true
